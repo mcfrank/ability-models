@@ -1,0 +1,174 @@
+---
+title: "Standard model IRT"
+author: "Mike"
+date: "11/12/2019"
+output: 
+  html_document:
+    toc: true
+---
+
+# Loading data 
+
+Package loading.
+
+```{r, message = FALSE, warn = FALSE}
+library(tidyverse)
+library(brms)
+library(wordbankr)
+theme_set(langcog::theme_mikabr())
+knitr::opts_chunk$set(cache = TRUE, warn = FALSE, message = FALSE)
+```
+
+
+```{r}
+ms <- d %>%
+  group_by(person, age, sex) %>%
+  summarise(produces = sum(produces))
+
+ggplot(ms, 
+       aes(x = age, y = produces, group = person, col = sex)) + 
+  geom_jitter(alpha = .2, width = .2)+ 
+  geom_line(alpha = .2) +
+  geom_smooth(aes(group = sex), span = 2, se = FALSE) + 
+  ggthemes::scale_color_solarized()
+  
+```
+
+
+Break into two time periods and subsample.
+
+```{r}
+earlier <- d %>%
+  group_by(person, age) %>%
+  count() %>%
+  group_by(person) %>%
+  mutate(earlier = ifelse(age == age[1], TRUE, FALSE),
+         twos = ifelse(age[1] == 24, TRUE, FALSE)) %>%
+  select(-n)
+
+d <- left_join(d, earlier)
+
+d_sub <- filter(d, 
+                category == "food_drink", 
+                twos)
+```
+
+Plotting the subsampled data. 
+
+```{r}
+ms <- d_sub %>%
+  group_by(person, age, sex) %>%
+  summarise(produces = sum(produces))
+
+ggplot(ms, 
+       aes(x = age, y = produces, group = person, col = sex)) + 
+  geom_jitter(alpha = .2, width = .2)+ 
+  geom_line(alpha = .2) +
+  geom_smooth(aes(group = sex), span = 2, se = FALSE) + 
+  ggthemes::scale_color_solarized() +
+  langcog::theme_mikabr() 
+  
+```
+
+
+
+# Models
+
+
+```{r}
+mcmurray <- '
+data {                            
+  int<lower=1> W; // number of words
+  int<lower=1> S; // number of subjects
+  int<lower=1> N; // number of datapoints (W*S)
+//  vector[S] age; // subject ages
+  int<lower=0,upper=1> produces[N]; // actual data
+}
+
+parameters {
+  real<lower=0> mu_w; // word mean
+  real<lower=0> mu_s; // subject mean
+  real<lower=0> sigma_w; // word SD
+  real<lower=0> sigma_s; // subject SD
+  real<lower=0> difficulty[W]; // word mean
+  real<lower=0> ability[S]; // subject mean
+}
+
+model {
+  mu_w ~ normal(0, 10); 
+  mu_s ~ normal(0, 10);
+  sigma_w ~ normal(0, 5);
+  sigma_s ~ normal(0, 5);
+  difficulty ~ normal(mu_w, sigma_w);
+  ability ~ normal(mu_s, sigma_s);
+
+  for (s in 1:S)
+    for (w in 1:W)
+      //  ability[s] * age[s]
+      produces[W*(s-1) + w] ~ bernoulli_logit((ability[s]) - difficulty[w]);
+}'
+```
+
+
+```{r}
+stan_data <- list(produces =  d1_sub$produces,
+                  W = 58, 
+                  S = 25, 
+                  N = 1700)
+```
+
+Run!
+
+```{r}
+library(rstan)
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+
+samps <- stan(model_code = mcmurray, 
+              model_name = "mcmurray_simple", 
+              data = stan_data, 
+              iter = 2000, warmup=200, thin=20, chains = 4, 
+              pars = c('mu_w','mu_s','sigma_w', 'sigma_s', 
+                       'difficulty', 'ability'), 
+              refresh=2000/4) 
+```
+  
+  
+  
+```{r}
+library(ggmcmc)
+S <- ggs(samps)
+ggs_caterpillar(S, family = "difficulty")
+```
+  
+
+
+
+
+
+
+
+
+<!-- ```{r} -->
+<!-- mod_1pl <- " -->
+<!-- data { -->
+<!--   int<lower=1> J;              // number of students -->
+<!--   int<lower=1> K;              // number of questions -->
+<!--   int<lower=1> N;              // number of observations -->
+<!--   int<lower=1,upper=J> jj[N];  // student for observation n -->
+<!--   int<lower=1,upper=K> kk[N];  // question for observation n -->
+<!--   int<lower=0,upper=1> y[N];   // correctness for observation n -->
+<!-- } -->
+<!-- parameters {     -->
+<!--   real delta;                  // mean student ability -->
+<!--   real alpha[J];               // ability of student j - mean ability -->
+<!--   real beta[K];                // difficulty of question k -->
+<!-- } -->
+<!-- model { -->
+<!--   alpha ~ normal(0,1);         // informative true prior -->
+<!--   beta ~ normal(0,1);          // informative true prior -->
+<!--   delta ~ normal(.75,1);       // informative true prior -->
+<!--   for (n in 1:N) -->
+<!--     y[n] ~ bernoulli_logit(alpha[jj[n]] - beta[kk[n]] + delta); -->
+<!-- }" -->
+<!-- ``` -->

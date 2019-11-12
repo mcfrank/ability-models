@@ -1,0 +1,301 @@
+---
+title: "Modeling demographic effects of ability"
+author: "Mike"
+date: "11/12/2019"
+output: 
+  html_document:
+    toc: true
+---
+
+# Loading data 
+
+Package loading.
+
+```{r, message = FALSE, warn = FALSE}
+library(tidyverse)
+library(brms)
+library(wordbankr)
+theme_set(langcog::theme_mikabr())
+knitr::opts_chunk$set(cache = TRUE, warn = FALSE, message = FALSE)
+```
+
+Data loading.
+
+```{r}
+wg_admins <- get_administration_data(language = "English (American)", 
+                                     form = "WS", original_ids = TRUE)
+
+wg_long <- wg_admins %>%
+  group_by(original_id, mom_ed) %>% 
+  count %>%
+  filter(n == 2,  !is.na(mom_ed))
+
+wg_long_admins <- left_join(wg_long, wg_admins)
+
+wg_items <- get_item_data(language = "English (American)", 
+                          form = "WS")
+  
+wg_all <- get_instrument_data(language = "English (American)", 
+                                     form = "WS", 
+                              items = filter(wg_items, 
+                                             type == "word") %>%
+                                pull(item_id))
+
+wg_long_byitem <- filter(wg_all, data_id %in% wg_long_admins$data_id) 
+```
+
+Make main dataframe.
+
+```{r}
+d <- left_join(wg_long_byitem, 
+               select(wg_long_admins, 
+                      data_id, original_id, age, mom_ed, sex)) %>%
+  mutate(produces = as.numeric(value == "produces")) %>%
+  select(-value) %>%
+  left_join(select(wg_items, num_item_id, definition, category)) %>%
+  rename(person = original_id, 
+         item = definition) %>%
+  select(person, age, sex, mom_ed, category, item, produces)
+```
+
+## Subsampling 
+
+```{r}
+ms <- d %>%
+  group_by(person, age, sex) %>%
+  summarise(produces = sum(produces))
+
+ggplot(ms, 
+       aes(x = age, y = produces, group = person, col = sex)) + 
+  geom_jitter(alpha = .2, width = .2)+ 
+  geom_line(alpha = .2) +
+  geom_smooth(aes(group = sex), span = 2, se = FALSE) + 
+  ggthemes::scale_color_solarized()
+  
+```
+
+
+Break into two time periods and subsample.
+
+```{r}
+earlier <- d %>%
+  group_by(person, age) %>%
+  count() %>%
+  group_by(person) %>%
+  mutate(earlier = ifelse(age == age[1], TRUE, FALSE),
+         twos = ifelse(age[1] == 24, TRUE, FALSE)) %>%
+  select(-n)
+
+d <- left_join(d, earlier)
+
+d_sub <- filter(d, 
+                category == "food_drink", 
+                twos)
+
+d1_sub <- filter(d_sub, earlier)
+d2_sub <- filter(d_sub, !earlier)
+```
+Plotting the subsampled data. 
+
+```{r}
+ms <- d_sub %>%
+  group_by(person, age, sex) %>%
+  summarise(produces = sum(produces))
+
+ggplot(ms, 
+       aes(x = age, y = produces, group = person, col = sex)) + 
+  geom_jitter(alpha = .2, width = .2)+ 
+  geom_line(alpha = .2) +
+  geom_smooth(aes(group = sex), span = 2, se = FALSE) + 
+  ggthemes::scale_color_solarized() +
+  langcog::theme_mikabr() 
+  
+```
+
+
+
+# Models
+
+## 1PL with no sex differences
+
+First fit 1pl to time 1. 
+
+```{r}
+formula_1pl <- produces ~ 1 + (1|person) + (1|item)
+  
+prior_1pl <-
+  prior("normal(0, 3)", class = "sd", group = "person") + 
+  prior("normal(0, 3)", class = "sd", group = "item")
+
+mod_d1_1pl <- brm(formula = formula_1pl,
+              prior = prior_1pl, 
+              family = brmsfamily(family = "bernoulli", link = "logit"),
+              data = d1_sub)
+```
+
+Basic summary of the model.
+
+```{r}
+summary(mod_d1_1pl)
+```
+
+Examine parameters. 
+
+```{r}
+plot(mod_d1_1pl)
+```
+
+Plot items. 
+
+```{r}
+items_1pl <- as_tibble(coef(mod_d1_1pl)$item[, , "Intercept"]) %>%
+  mutate(item = rownames(coef(mod_d1_1pl)$item[, , "Intercept"]), 
+         item = fct_reorder(item, Estimate))
+
+ggplot(items_1pl, 
+       aes(x = item, y = Estimate)) + 
+  geom_pointrange(aes(ymin = Q2.5, ymax = Q97.5)) + 
+  coord_flip()
+```
+
+Now plot people. 
+
+```{r}
+persons_1pl <- as_tibble(ranef(mod_d1_1pl)$person[, , "Intercept"]) %>%
+  mutate(person = rownames(ranef(mod_d1_1pl)$person[, , "Intercept"])) %>%
+  left_join(d1_sub %>%
+              group_by(person, age, sex) %>% count()) %>%
+  mutate(person = fct_reorder(person, Estimate))
+
+ggplot(persons_1pl, 
+       aes(x = person, y = Estimate, col = sex)) + 
+  geom_pointrange(aes(ymin = Q2.5, ymax = Q97.5)) + 
+  coord_flip()
+```
+
+## 1PL with sex differences and DIF
+
+Now think about modeling sex differences. 
+
+Classically, DIF would be written as a fied effect of sex plus a random effect of sex by item. 
+
+```{r}
+formula_1pl_dif <- produces ~ sex + (1 | person) + (sex | item)
+  
+prior_1pl_dif <-
+  prior("normal(0, 3)", class = "sd", group = "person") + 
+  prior("normal(0, 3)", class = "sd", group = "item") 
+
+mod_d1_1pl_dif <- brm(formula = formula_1pl_dif,
+                      prior = prior_1pl_dif, 
+                      family = brmsfamily(family = "bernoulli", 
+                                          link = "logit"),
+                      data = d1_sub)
+```
+```{r}
+plot(mod_d1_1pl_dif, pars = c("b_sexMale", "sd_item__sexMale"))
+```
+
+
+Plot items and DIF scores. Spoiler, there are no DIF effects on our subsample, food items.  
+
+```{r}
+items_1pl_dif <- bind_rows(
+  as_tibble(coef(mod_d1_1pl_dif)$item[, , "Intercept"]) %>% 
+    mutate(coef = "Intercept"), 
+  as_tibble(ranef(mod_d1_1pl_dif)$item[, , "sexMale"]) %>% 
+    mutate(coef = "sexMale")) %>%
+  mutate(item = rep(rownames(coef(mod_d1_1pl_dif)$item[, , "Intercept"]),2), 
+         item = fct_reorder(item, Estimate))
+
+ggplot(items_1pl_dif, 
+       aes(x = item, y = Estimate)) + 
+  geom_pointrange(aes(ymin = Q2.5, ymax = Q97.5)) + 
+  coord_flip() + 
+  facet_grid(.~coef, scales = "free_x")
+```
+
+Now plot people. 
+
+```{r}
+
+persons_1pl_dif <- as_tibble(ranef(mod_d1_1pl_dif)$person[, , "Intercept"]) %>%
+  mutate(person = rownames(ranef(mod_d1_1pl_dif)$person[, , "Intercept"])) %>%
+  left_join(d1_sub %>%
+              group_by(person, age, sex) %>% count()) %>%
+  mutate(person = fct_reorder(person, Estimate))
+
+persons_1pl_dif_coef <- as_tibble(coef(mod_d1_1pl_dif)$person[, , "Intercept"]) %>%
+  mutate(person = rownames(coef(mod_d1_1pl_dif)$person[, , "Intercept"])) %>%
+  left_join(d1_sub %>%
+              group_by(person, age, sex) %>% count()) %>%
+  mutate(person = fct_reorder(person, Estimate))
+
+ggplot(persons_1pl_dif, 
+       aes(x = person, y = Estimate, col = sex)) + 
+  geom_pointrange(aes(ymin = Q2.5, ymax = Q97.5)) + 
+  coord_flip()
+```
+
+## Comparison of DIF and non-DIF models
+
+Plot sex-DIF vs. non-sex-DIF estimates for people, showing the differences in the random ability estimates.  
+
+
+```{r}
+compare_dif <- tibble(estimate = persons_1pl$Estimate, 
+                      estimate_dif = persons_1pl_dif$Estimate,
+                      estimate_dif_coef = persons_1pl_dif_coef$Estimate,
+                      sex = persons_1pl$sex)
+
+ggplot(data = compare_dif, 
+       aes(x = estimate, y = estimate_dif, 
+           col = sex)) +
+  geom_point() + 
+  geom_abline(lty = 2) 
+
+# p2 <- ggplot(data = compare_dif, 
+#        aes(x = estimate, y = estimate_dif_coef, 
+#            col = sex)) +
+#   geom_point() + 
+#   geom_abline(lty = 2) + 
+#   theme(legend.pos = "bottom")
+# 
+# cowplot::plot_grid(p1,p2)
+```
+
+
+You can get:
+
+1. Estimate of absolute ability. How good are you compared to other people. 
+2. Demographically-adjusted estimate of ability. Effectively, how good are are you compared to other people, if you weren't in your demographic group. 
+
+This second is of interest in reasoning about "ability in context." 
+
+One way of formalizing the affirmative action hypothesis is the idea that, for some demographics, (2) should be a better predictor of future performance than (1). 
+
+<!-- # More parameters  -->
+
+<!-- (too slow at the moment) -->
+
+<!-- ```{r, eval=FALSE} -->
+<!-- formula_2pl <- bf(produces ~ exp(logalpha) * eta, -->
+<!--   eta ~ 1 + (1 |i| item) + (1 | person),  -->
+<!--   logalpha ~ 1 + (1 |i| item), -->
+<!--   nl = TRUE) -->
+
+<!-- prior_2pl <- -->
+<!--   prior("normal(0, 5)", class = "b", nlpar = "eta") + -->
+<!--   prior("normal(0, 1)", class = "b", nlpar = "logalpha") + -->
+<!--   prior("normal(0, 3)", class = "sd", group = "person", nlpar = "eta") + -->
+<!--   prior("normal(0, 3)", class = "sd", group = "item", nlpar = "eta") + -->
+<!--   prior("normal(0, 1)", class = "sd", group = "item", nlpar = "logalpha") -->
+
+
+<!-- mod_d1 <- brm(formula = formula_2pl, -->
+<!--               prior = prior_2pl,  -->
+<!--               family = brmsfamily(family = "bernoulli", link = "logit"), -->
+<!--               data = d1) -->
+
+<!-- ``` -->
+
